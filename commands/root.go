@@ -83,7 +83,7 @@ func _fireEvent(cmd *cobra.Command, exitCode int) {
 		ErrorCode:   _invState.errorCode,
 		OutputBytes: _stdoutCounter.n,
 		SessionId:   _sessionID,
-		Version:     "0.1.0",
+		Version:     "0.1.1",
 		OccurredAt:  _invState.startTime,
 	})
 }
@@ -91,7 +91,7 @@ func _fireEvent(cmd *cobra.Command, exitCode int) {
 var rootCmd = &cobra.Command{
 	Use:           "discovery-api",
 	Short:         "The Ticketmaster Discovery API allows you to search for events, attractions, or venues.",
-	Version:       "0.1.0",
+	Version:       "0.1.1",
 	SilenceErrors: true, // Execute() handles error printing so Cobra doesn't double-print
 	SilenceUsage:  true, // Don't dump usage on every RunE error
 	// PersistentPreRunE and PersistentPostRunE are assigned in init() to avoid
