@@ -1,27 +1,92 @@
 package commands
 
 import (
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"time"
 
+	"github.com/example/discovery-api/internal/telemetry"
 	"github.com/rishimantri795/CLICreator/runtime/config"
 	"github.com/rishimantri795/CLICreator/runtime/output"
-	"github.com/rishimantri795/CLICreator/runtime/telemetry"
+	"github.com/rishimantri795/CLICreator/runtime/session"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
 
-// _telemetryToken is baked in at CLI generation time.
-// Empty string means telemetry was not configured — NoopClient is used.
-const _telemetryToken = "c3c7b5d7-7d90-4805-81ef-4755134531f0"
+// _telemetryClient is nil when telemetry is disabled (token/endpoint not
+// configured, or user has set DO_NOT_TRACK / {PREFIX}_NO_TELEMETRY).
+var _telemetryClient = telemetry.New()
 
-// _defaultBaseURL is the API base URL baked in at generation time.
-// Used to produce a privacy-preserving environment fingerprint in telemetry events.
-const _defaultBaseURL = "https://app.ticketmaster.com"
+// _configDir is the CLI's config directory (~/.config/<cliName>/).
+// It holds the config file, OAuth token, and the session_id file.
+var _configDir = func() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".config", "discovery-api")
+}()
+
+// _sessionID is resolved once per process via the 30-minute idle-window file.
+// Two processes sharing _configDir (parallel agent invocations in the same
+// project) intentionally share a session ID.
+var _sessionID = session.GetOrCreateSessionID(_configDir)
+
+// _invState is reset by PersistentPreRunE and read by _fireEvent.
+// CLI commands are sequential, so no synchronisation is needed.
+var _invState struct {
+	startTime time.Time
+	cmd       *cobra.Command
+	errorType string
+	errorCode int
+}
+
+// _stdoutCounter wraps os.Stdout and tallies bytes written by command handlers.
+// All output.Print / output.JQFilter calls go through this so outputBytes is
+// accurate without instrumenting every call site individually.
+var _stdoutCounter = &countingWriter{w: os.Stdout}
+
+// countingWriter wraps an io.Writer and accumulates a running byte total.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (cw *countingWriter) Write(p []byte) (int, error) {
+	n, err := cw.w.Write(p)
+	cw.n += int64(n)
+	return n, err
+}
+
+// _fireEvent constructs and fires one telemetry event for the given command.
+// Called from PersistentPostRunE (success path) and Execute (error path).
+func _fireEvent(cmd *cobra.Command, exitCode int) {
+	var flagsUsed []string
+	cmd.Flags().Visit(func(f *pflag.Flag) {
+		flagsUsed = append(flagsUsed, f.Name)
+	})
+	group := ""
+	if p := cmd.Parent(); p != nil && p != rootCmd {
+		group = p.Name()
+	}
+	_telemetryClient.Fire(telemetry.Event{
+		Command:     cmd.Name(),
+		Group:       group,
+		FlagsUsed:   flagsUsed,
+		ExitCode:    exitCode,
+		LatencyMs:   time.Since(_invState.startTime).Milliseconds(),
+		ErrorType:   _invState.errorType,
+		ErrorCode:   _invState.errorCode,
+		OutputBytes: _stdoutCounter.n,
+		SessionId:   _sessionID,
+		Version:     "0.1.0",
+		OccurredAt:  _invState.startTime,
+	})
+}
 
 var rootCmd = &cobra.Command{
 	Use:           "discovery-api",
@@ -29,6 +94,9 @@ var rootCmd = &cobra.Command{
 	Version:       "0.1.0",
 	SilenceErrors: true, // Execute() handles error printing so Cobra doesn't double-print
 	SilenceUsage:  true, // Don't dump usage on every RunE error
+	// PersistentPreRunE and PersistentPostRunE are assigned in init() to avoid
+	// an initialization cycle: the var literal would reference _fireEvent, which
+	// references rootCmd, which is not yet initialised at that point.
 }
 
 // rootFlags holds the values of global flags available on every command.
@@ -50,17 +118,21 @@ var _configLoader = &config.Loader{
 	DefaultURL:   "https://app.ticketmaster.com",
 }
 
-// _telemetryClient is the active telemetry sink, initialised in init().
-// NoopClient when token is empty or the user has set <PREFIX>_NO_TELEMETRY=1.
-var _telemetryClient telemetry.Client
-
 func init() {
-	// Initialise telemetry — NoopClient has zero overhead when disabled.
-	// DISCOVERY_API_TELEMETRY_ENDPOINT overrides the default ingest URL (useful for local testing).
-	if _telemetryToken != "" && os.Getenv("DISCOVERY_API_NO_TELEMETRY") == "" {
-		_telemetryClient = telemetry.New(_telemetryToken, os.Getenv("DISCOVERY_API_TELEMETRY_ENDPOINT"), "")
-	} else {
-		_telemetryClient = telemetry.NoopClient{}
+	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+		_invState.startTime = time.Now()
+		_invState.cmd = cmd
+		_invState.errorType = ""
+		_invState.errorCode = 0
+		_stdoutCounter.n = 0
+		return nil
+	}
+	// PersistentPostRunE fires only when RunE succeeds (exit 0).
+	// The error path is handled in Execute() using _invState.cmd.
+	rootCmd.PersistentPostRunE = func(cmd *cobra.Command, args []string) error {
+		_fireEvent(cmd, 0)
+		session.Touch(_configDir) // extend the 30-minute idle window
+		return nil
 	}
 
 	rootCmd.PersistentFlags().StringVarP(&rootFlags.outputFormat, "output-format", "o", "", "Output format: json, table, yaml, raw")
@@ -76,9 +148,19 @@ func init() {
 	// Save the default help func first so the human branch can call it directly.
 	defaultHelp := rootCmd.HelpFunc()
 	rootCmd.SetHelpFunc(func(cmd *cobra.Command, args []string) {
+		// --help/-h is intercepted by Cobra before PersistentPreRunE fires, so
+		// telemetry hooks never run for help calls. Initialise _invState here so
+		// _fireEvent has valid data and we get one event per help lookup.
+		_invState.startTime = time.Now()
+		_invState.cmd = cmd
+		_invState.errorType = ""
+		_invState.errorCode = 0
+		_stdoutCounter.n = 0
+
 		if output.DetectAgentMode(rootFlags.agentMode) {
 			if cmd.RunE != nil {
 				// Leaf command — delegate to its RunE with schema mode set.
+				// RunE writes through _stdoutCounter, so outputBytes is accurate.
 				rootFlags.schema = true
 				_ = cmd.RunE(cmd, args)
 			} else {
@@ -98,96 +180,19 @@ func init() {
 					"description": cmd.Short,
 					"subcommands": subs,
 				}, "", "  ")
-				fmt.Println(string(data))
+				fmt.Fprintln(_stdoutCounter, string(data))
 			}
-			return
+		} else {
+			// Human — restore default Cobra help.
+			// Prose output goes directly to os.Stdout (not _stdoutCounter),
+			// so outputBytes will be 0 for human help calls.
+			defaultHelp(cmd, args)
 		}
-		// Human — restore default Cobra help.
-		defaultHelp(cmd, args)
+
+		_fireEvent(cmd, 0)
+		session.Touch(_configDir)
 	})
 	rootCmd.PersistentFlags().StringVar(&rootFlags.apiKey, "api-key", "", "API key (env: DISCOVERY_API_API_KEY)")
-}
-
-// withTelemetry wraps a Cobra RunE function to emit one telemetry event after the
-// command completes. It is the single instrumentation point — every leaf command is
-// wrapped here; auth commands (configure, login, logout) are intentionally excluded.
-//
-// Privacy contract:
-//   - Only flag NAMES are collected, never their values.
-//   - The base URL is SHA-256 hashed before inclusion.
-//   - Delivery is async; the command is never blocked by telemetry.
-func withTelemetry(fn func(*cobra.Command, []string) error) func(*cobra.Command, []string) error {
-	return func(cmd *cobra.Command, args []string) error {
-		// Fast path: skip all telemetry work when no token is configured.
-		if _telemetryToken == "" {
-			return fn(cmd, args)
-		}
-
-		start := time.Now()
-		err := fn(cmd, args)
-
-		// Collect flag NAMES that were explicitly set by the caller.
-		// Values are intentionally omitted — they may contain credentials or PII.
-		var flagsUsed []string
-		cmd.Flags().Visit(func(f *pflag.Flag) {
-			flagsUsed = append(flagsUsed, f.Name)
-		})
-
-		// Map the returned error to an exit code and structured error code.
-		exitCode := 0
-		errorCode := ""
-		httpStatus := 0
-		if err != nil {
-			var exitErr *output.ExitError
-			if errors.As(err, &exitErr) {
-				exitCode = exitErr.ExitCode()
-				if exitErr.CLI != nil {
-					errorCode = exitErr.CLI.Code
-					httpStatus = exitErr.CLI.Status
-				}
-			} else {
-				exitCode = output.ExitErr
-				errorCode = "error"
-			}
-		}
-
-		caller := telemetry.DetectCaller()
-
-		// Hash the base URL to fingerprint the deployment environment
-		// without storing the URL itself.
-		baseURL := rootFlags.baseURL
-		if baseURL == "" {
-			baseURL = _defaultBaseURL
-		}
-		var baseURLHash string
-		if baseURL != "" {
-			sum := sha256.Sum256([]byte(baseURL))
-			baseURLHash = fmt.Sprintf("%x", sum[:8]) // 16 hex chars of SHA-256
-		}
-
-		evt := telemetry.Event{
-			CLIID:        _telemetryToken,
-			CLIName:      "discovery-api",
-			CLIVersion:   "0.1.0",
-			Command:      cmd.CommandPath(),
-			CallerType:   string(caller.Type),
-			AgentType:    caller.AgentType,
-			SessionID:    caller.SessionID,
-			Timestamp:    start,
-			DurationMS:   time.Since(start).Milliseconds(),
-			FlagsUsed:    flagsUsed,
-			OutputFormat: rootFlags.outputFormat,
-			UsedJQ:       rootFlags.jq != "",
-			UsedSchema:   rootFlags.schema,
-			UsedDryRun:   rootFlags.dryRun,
-			ExitCode:     exitCode,
-			ErrorCode:    errorCode,
-			HTTPStatus:   httpStatus,
-			BaseURLHash:  baseURLHash,
-		}
-		_telemetryClient.Track(evt) // non-blocking: increments WaitGroup then starts goroutine
-		return err
-	}
 }
 
 // rootConfig resolves credentials and settings from flags, env vars, and config file.
@@ -211,20 +216,30 @@ func rootConfig() (*config.Config, error) {
 	return _configLoader.Load(flags)
 }
 
-// Execute runs the root command. Called from main().
-// Telemetry is flushed explicitly before every os.Exit call because deferred
-// functions are NOT run by os.Exit — if we only used defer, error-path events
-// (4xx, network failures) would be silently dropped.
+// Execute runs the root command. Telemetry is flushed before every os.Exit.
+//
+// For the success path, PersistentPostRunE fires the event. For the error path,
+// Cobra does not call PersistentPostRunE, so we fire it here using the state
+// that PersistentPreRunE captured in _invState before RunE ran.
 func Execute() {
 	if err := rootCmd.Execute(); err != nil {
-		_telemetryClient.Flush() // flush before exit so error events are not lost
 		var exitErr *output.ExitError
+		exitCode := output.ExitErr
 		if errors.As(err, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		}
+		// Fire for the error path. _invState.cmd is nil when Cobra fails before
+		// PersistentPreRunE (e.g. unknown flag), in which case we skip telemetry.
+		if _invState.cmd != nil {
+			_fireEvent(_invState.cmd, exitCode)
+			session.Touch(_configDir) // extend the 30-minute idle window
+		}
+		_telemetryClient.Flush()
+		if exitErr != nil {
 			os.Exit(exitErr.ExitCode())
 		}
-		// Generic Cobra error (unknown flag, missing arg, etc.) — print and exit 1.
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	_telemetryClient.Flush() // flush on clean exit
+	_telemetryClient.Flush()
 }

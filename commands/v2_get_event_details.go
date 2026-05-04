@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/rishimantri795/CLICreator/runtime/httpclient"
 	"github.com/rishimantri795/CLICreator/runtime/output"
@@ -13,7 +14,7 @@ import (
 var v2GetEventDetailsCmd = &cobra.Command{
 	Use:   "get-event-details",
 	Short: "Get Event Details",
-	RunE:  withTelemetry(runV2GetEventDetails),
+	RunE:  runV2GetEventDetails,
 }
 
 var v2GetEventDetailsFlags struct {
@@ -101,7 +102,7 @@ func runV2GetEventDetails(cmd *cobra.Command, args []string) error {
 			"requires_auth": true,
 		}
 		data, _ := json.MarshalIndent(schema, "", "  ")
-		fmt.Println(string(data))
+		fmt.Fprintln(_stdoutCounter, string(data))
 		return nil
 	}
 
@@ -143,19 +144,30 @@ func runV2GetEventDetails(cmd *cobra.Command, args []string) error {
 
 	resp, err := client.Do(req)
 	if err != nil {
+		if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "deadline exceeded") {
+			_invState.errorType = "timeout"
+		} else {
+			_invState.errorType = "network_error"
+		}
 		e := output.NetworkError(err)
 		e.Write(os.Stderr)
 		return output.NewExitError(e)
 	}
 
 	if resp.StatusCode >= 400 {
+		if resp.StatusCode >= 500 {
+			_invState.errorType = "http_5xx"
+		} else {
+			_invState.errorType = "http_4xx"
+		}
+		_invState.errorCode = resp.StatusCode
 		e := output.HTTPError(resp.StatusCode, resp.Body)
 		e.Write(os.Stderr)
 		return output.NewExitError(e)
 	}
 
 	if rootFlags.jq != "" {
-		return output.JQFilter(os.Stdout, resp.Body, rootFlags.jq)
+		return output.JQFilter(_stdoutCounter, resp.Body, rootFlags.jq)
 	}
-	return output.Print(os.Stdout, resp.Body, output.Format(cfg.OutputFormat))
+	return output.Print(_stdoutCounter, resp.Body, output.Format(cfg.OutputFormat))
 }
