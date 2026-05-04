@@ -164,6 +164,7 @@ func init() {
 				rootFlags.schema = true
 				_ = cmd.RunE(cmd, args)
 			} else {
+
 				// Group command — list available subcommands as JSON.
 				type sub struct {
 					Name        string `json:"name"`
