@@ -1,0 +1,41 @@
+cli:
+  name: discovery-api
+  env_prefix: DISCOVERY_API
+  version: "0.1.0"
+
+environments:
+  production: https://app.ticketmaster.com
+
+security_schemes:
+  apiKey:
+    type: apiKey
+    in: query
+    name: apikey
+
+security:
+  - apiKey: []
+
+client_settings:
+  opts:
+    api_key:
+      type: string
+      read_env: DISCOVERY_API_API_KEY
+      auth:
+        security_scheme: apiKey
+
+resources:
+  v2:
+    methods:
+      search-attractions: "get /discovery/v2/attractions"
+      get-attraction-details: "get /discovery/v2/attractions/{id}"
+      search-classifications: "get /discovery/v2/classifications"
+      get-genre-details: "get /discovery/v2/classifications/genres/{id}"
+      get-segment-details: "get /discovery/v2/classifications/segments/{id}"
+      get-subgenre-details: "get /discovery/v2/classifications/subgenres/{id}"
+      get-classification-details: "get /discovery/v2/classifications/{id}"
+      event-search: "get /discovery/v2/events"
+      get-event-details: "get /discovery/v2/events/{id}"
+      get-event-images: "get /discovery/v2/events/{id}/images"
+      find-suggest: "get /discovery/v2/suggest"
+      find-venues: "get /discovery/v2/venues"
+      get-venue-details: "get /discovery/v2/venues/{id}"

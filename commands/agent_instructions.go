@@ -1,0 +1,146 @@
+package commands
+
+import (
+	"fmt"
+
+	"github.com/spf13/cobra"
+)
+
+// agentInstructionsCmd prints the llms.txt content at runtime so agents can
+// include it in their system prompt without needing a separate file:
+//
+//	INSTRUCTIONS=$(discovery-api agent-instructions)
+var agentInstructionsCmd = &cobra.Command{
+	Use:   "agent-instructions",
+	Short: "Print machine-readable instructions for AI agents (llms.txt format)",
+	Long: `Prints a complete description of this CLI's commands, flags, exit codes,
+and usage patterns optimised for inclusion in an AI agent's system prompt.
+
+Example:
+  # Include in Claude Code context:
+  discovery-api agent-instructions > CLAUDE.md
+
+  # Capture inline:
+  INSTRUCTIONS=$(discovery-api agent-instructions)`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		fmt.Print(agentInstructionsContent)
+		return nil
+	},
+}
+
+func init() {
+	rootCmd.AddCommand(agentInstructionsCmd)
+}
+
+// agentInstructionsContent is the full llms.txt baked into the binary at build time.
+// Regenerate by re-running the CLI generator against the same OpenAPI spec.
+const agentInstructionsContent = `# discovery-api
+
+The Ticketmaster Discovery API allows you to search for events, attractions, or venues.
+
+This file is the agent-facing overview of the ` + "`" + `discovery-api` + "`" + ` CLI. It explains what the tool does and how to use it well — *not* every flag of every command. For per-command details run ` + "`" + `discovery-api <command> --help` + "`" + ` or ` + "`" + `discovery-api <command> --schema` + "`" + ` (returns JSON).
+
+## Install
+
+The binary is ` + "`" + `discovery-api` + "`" + `. Build from source or download a release.
+
+## Authentication
+
+- API key — set ` + "`" + `DISCOVERY_API_API_KEY` + "`" + ` or pass ` + "`" + `--api-key <key>` + "`" + `
+
+Run ` + "`" + `discovery-api configure` + "`" + ` to set credentials interactively.
+
+## Commands
+
+discovery-api groups operations by resource. One or two examples per group below — for the full set of commands and flags use ` + "`" + `discovery-api <group> --help` + "`" + `.
+
+### ` + "`" + `v2` + "`" + `
+
+` + "`" + `` + "`" + `` + "`" + `bash
+discovery-api v2 event-search    # Event Search
+` + "`" + `` + "`" + `` + "`" + `
+
+` + "`" + `` + "`" + `` + "`" + `bash
+discovery-api v2 find-suggest    # Find Suggest
+` + "`" + `` + "`" + `` + "`" + `
+
+List all commands in this group: ` + "`" + `discovery-api v2 --help` + "`" + `
+
+
+## Output and parsing
+
+All output is JSON by default and goes to stdout. Errors go to stderr as a single-line JSON object — stdout stays clean for piping.
+
+` + "`" + `` + "`" + `` + "`" + `bash
+discovery-api <cmd> --jq <path>          # extract fields without jq installed (GJSON syntax)
+discovery-api <cmd> -o yaml              # change format: json (default), yaml, table, compact, raw, pretty
+discovery-api <cmd> --dry-run            # print the HTTP request without sending it
+discovery-api <cmd> --schema             # JSON schema of inputs and outputs for that command
+` + "`" + `` + "`" + `` + "`" + `
+
+GJSON path examples:
+- ` + "`" + `--jq id` + "`" + ` — scalar
+- ` + "`" + `--jq items.#.id` + "`" + ` — every id from an array
+- ` + "`" + `--jq "items.#(active==true)#"` + "`" + ` — filter array by condition
+
+## Exit codes
+
+Branch on ` + "`" + `$?` + "`" + ` rather than parsing stderr:
+
+| Code | Meaning |
+|------|---------|
+| 0 | success |
+| 1 | unknown error |
+| 2 | auth failed (401 / 403) |
+| 3 | not found (404) |
+| 4 | validation error (400 / 422) |
+| 5 | rate limited (429) |
+| 6 | server error (5xx) |
+| 7 | network error |
+
+Error JSON shape on stderr:
+` + "`" + `` + "`" + `` + "`" + `json
+{"error":true,"code":"not_found","status":404,"message":"...","exit_code":3}
+` + "`" + `` + "`" + `` + "`" + `
+
+## Common workflows
+
+### List then fetch one
+` + "`" + `` + "`" + `` + "`" + `bash
+ID=$(discovery-api <group> list --jq "items.0.id")
+discovery-api <group> get --id "$ID"
+` + "`" + `` + "`" + `` + "`" + `
+
+### Capture a created ID
+` + "`" + `` + "`" + `` + "`" + `bash
+ID=$(discovery-api <group> create [flags] --jq id)
+` + "`" + `` + "`" + `` + "`" + `
+
+### Safe destructive call
+` + "`" + `` + "`" + `` + "`" + `bash
+discovery-api <group> delete --id X --dry-run    # inspect first
+discovery-api <group> delete --id X              # exit 0 = deleted, 3 = not found
+` + "`" + `` + "`" + `` + "`" + `
+
+### Branch on exit code
+` + "`" + `` + "`" + `` + "`" + `bash
+discovery-api <cmd> [flags]
+case $? in
+  0) : success ;;
+  2) echo "fix credentials" ;;
+  3) echo "not found, skip" ;;
+  5) sleep 10 ; retry ;;
+esac
+` + "`" + `` + "`" + `` + "`" + `
+
+## Discovering more
+
+` + "`" + `` + "`" + `` + "`" + `bash
+discovery-api --help                              # top-level groups
+discovery-api <group> --help                      # commands in a group
+discovery-api <group> <cmd> --help                # flags + description
+discovery-api <group> <cmd> --schema              # JSON schema
+discovery-api agent-instructions                  # this file, embedded in the binary
+` + "`" + `` + "`" + `` + "`" + `
+
+`
